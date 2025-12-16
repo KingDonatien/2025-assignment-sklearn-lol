@@ -58,6 +58,7 @@ from sklearn.model_selection import BaseCrossValidator
 
 from sklearn.utils.validation import check_is_fitted
 from sklearn.utils.validation import validate_data
+from sklearn.utils.multiclass import check_classification_targets
 from sklearn.metrics.pairwise import pairwise_distances
 
 
@@ -82,6 +83,12 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         self : instance of KNearestNeighbors
             The current instance of the classifier
         """
+        X, y = validate_data(self, X=X, y=y)
+        check_classification_targets(y)  # Check that y is not continuous
+        self.classes_ = np.unique(y)
+        self.X_ = X
+        self.y_ = y
+        self.n_features_in_ = X.shape[1]
         return self
 
     def predict(self, X):
@@ -97,7 +104,24 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
         y : ndarray, shape (n_test_samples,)
             Predicted class labels for each test data sample.
         """
-        y_pred = np.zeros(X.shape[0])
+        check_is_fitted(self)
+        X = validate_data(self, X=X, reset=False)
+
+        # Compute distances between X and self.X_
+        distances = pairwise_distances(X, self.X_)
+
+        # Find indices of the n_neighbors closest points
+        neigh_indices = np.argsort(distances, axis=1)[:, :self.n_neighbors]
+
+        # Get the labels of these neighbors
+        neigh_labels = self.y_[neigh_indices]
+
+        # Find the most common label for each sample (mode)
+        y_pred = np.empty(X.shape[0], dtype=self.y_.dtype)
+        for i in range(X.shape[0]):
+            modes, counts = np.unique(neigh_labels[i], return_counts=True)
+            y_pred[i] = modes[np.argmax(counts)]
+
         return y_pred
 
     def score(self, X, y):
@@ -111,11 +135,12 @@ class KNearestNeighbors(ClassifierMixin, BaseEstimator):
             target values.
 
         Returns
-        ----------
+        -------
         score : float
             Accuracy of the model computed for the (X, y) pairs.
         """
-        return 0.
+        X, y = validate_data(self, X=X, y=y, reset=False)
+        return np.mean(self.predict(X) == y)
 
 
 class MonthlySplit(BaseCrossValidator):
@@ -155,9 +180,26 @@ class MonthlySplit(BaseCrossValidator):
         n_splits : int
             The number of splits.
         """
-        return 0
+        if self.time_col == 'index':
+            dates = X.index
+        else:
+            if self.time_col not in X.columns:
+                raise ValueError(f"Column {self.time_col} not found in X")
+            dates = X[self.time_col]
 
-    def split(self, X, y, groups=None):
+        # Explicitly check for datetime type
+        if not pd.api.types.is_datetime64_any_dtype(dates):
+            raise ValueError(
+                f"The column {self.time_col} is not a datetime."
+            )
+
+        # Force to DatetimeIndex so we can use .to_period directly
+        # .dt accessor is only for Series, not Index
+        dates = pd.Index(pd.to_datetime(dates))
+        unique_months = dates.to_period('M').unique()
+        return len(unique_months) - 1
+
+    def split(self, X, y=None, groups=None):
         """Generate indices to split data into training and test set.
 
         Parameters
@@ -171,18 +213,39 @@ class MonthlySplit(BaseCrossValidator):
             Always ignored, exists for compatibility.
 
         Yields
-        ------
+        -------
         idx_train : ndarray
             The training set indices for that split.
         idx_test : ndarray
             The testing set indices for that split.
         """
+        if self.time_col == 'index':
+            dates = X.index
+        else:
+            if self.time_col not in X.columns:
+                raise ValueError(f"Column {self.time_col} not found in X")
+            dates = X[self.time_col]
 
-        n_samples = X.shape[0]
-        n_splits = self.get_n_splits(X, y, groups)
-        for i in range(n_splits):
-            idx_train = range(n_samples)
-            idx_test = range(n_samples)
-            yield (
-                idx_train, idx_test
+        if not pd.api.types.is_datetime64_any_dtype(dates):
+            raise ValueError(
+                f"The column {self.time_col} is not a datetime."
             )
+
+        # Unified handling of dates as Index
+        dates = pd.Index(pd.to_datetime(dates))
+        months = dates.to_period('M')
+        unique_months = sorted(months.unique())
+
+        n_splits = self.get_n_splits(X, y, groups)
+
+        for i in range(n_splits):
+            train_month = unique_months[i]
+            test_month = unique_months[i + 1]
+
+            train_mask = (months == train_month)
+            test_mask = (months == test_month)
+
+            idx_train = np.where(train_mask)[0]
+            idx_test = np.where(test_mask)[0]
+
+            yield idx_train, idx_test
